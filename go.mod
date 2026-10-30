@@ -254,4 +254,6 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
-replace github.com/xtls/xray-core v1.260930.0 => github.com/sinalphabeta/Xray-core v0.0.0-20261030155817-4e6aec0b81cd
+replace github.com/xtls/xray-core v1.260930.0 => github.com/sinalphabeta/Xray-core v0.0.0-20261030170258-e13c5fe2cc6d
+
+replace github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0 => github.com/sinalphabeta/REALITY v0.0.0-20261030170207-a3f903edfbbf
