@@ -176,24 +176,36 @@ install_base() {
             echo "安装 EPEL 源..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv
+        need_install_yum wget curl unzip tar cronie socat ca-certificates pv bash-completion
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
         need_install_apk wget curl unzip tar socat ca-certificates pv
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv bash-completion
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv bash-completion
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "更新包数据库..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed 会跳过已安装的包，非常高效
         echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv bash-completion >/dev/null 2>&1
     fi
+}
+
+install_completion() {
+    local completion_url="https://raw.githubusercontent.com/sinalphabeta/v2node/main/script/v2node-completion.bash"
+    local dest="/usr/share/bash-completion/completions/v2node"
+    mkdir -p /usr/share/bash-completion/completions /etc/bash_completion.d
+    if ! curl -fsSL -o "$dest" "$completion_url"; then
+        echo -e "${yellow}bash 补全脚本下载失败，命令补全未安装${plain}"
+        rm -f "$dest"
+        return 0
+    fi
+    cp "$dest" /etc/bash_completion.d/v2node
 }
 
 # 0: running, 1: not running, 2: not installed
@@ -377,6 +389,7 @@ EOF
 
     curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/sinalphabeta/v2node/main/script/v2node.sh
     chmod +x /usr/bin/v2node
+    install_completion
 
     cd $cur_dir
     rm -f install.sh

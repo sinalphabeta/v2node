@@ -178,6 +178,7 @@ uninstall() {
     fi
     rm /etc/v2node/ -rf
     rm /usr/local/v2node/ -rf
+    rm -f /usr/share/bash-completion/completions/v2node /etc/bash_completion.d/v2node
 
     echo ""
     echo -e "卸载成功，如果你想删除此脚本，则退出脚本后运行 ${green}rm /usr/bin/v2node -f${plain} 进行删除"
