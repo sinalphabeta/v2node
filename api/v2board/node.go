@@ -200,7 +200,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 			}
 		}
 	}
-	if cm.CertInfo.CertMode == "remote" {
+	if cm.CertInfo.CertMode == "remote" || cm.CertInfo.CertMode == "push" {
 		cm.CertInfo.TlsCert = cm.TlsSettings.TlsCert
 		cm.CertInfo.TlsKey = cm.TlsSettings.TlsKey
 	}

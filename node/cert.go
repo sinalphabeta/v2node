@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -32,6 +34,17 @@ func (c *Controller) renewCertTask(_ context.Context) error {
 
 func (c *Controller) requestCert() error {
 	cert := c.info.Common.CertInfo
+	if cert.CertMode != "none" && cert.CertMode != "" {
+		if err := safeCertPath(cert.CertFile); err != nil {
+			return err
+		}
+		if err := safeCertPath(cert.KeyFile); err != nil {
+			return err
+		}
+		if cert.CertFile == cert.KeyFile {
+			return fmt.Errorf("cert file and key file must be different")
+		}
+	}
 	switch cert.CertMode {
 	case "none", "":
 	case "file":
@@ -83,11 +96,41 @@ func (c *Controller) requestCert() error {
 		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
 			return fmt.Errorf("write remote key error: %s", err)
 		}
+	case "push":
+		if cert.CertFile == "" || cert.KeyFile == "" {
+			return fmt.Errorf("cert file path or key file path not exist")
+		}
+		if cert.TlsCert == "" || cert.TlsKey == "" {
+			return fmt.Errorf("tls cert or tls key not exist")
+		}
+		if err := writeIfChanged(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
+			return fmt.Errorf("write push cert error: %s", err)
+		}
+		if err := writeIfChanged(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
+			return fmt.Errorf("write push key error: %s", err)
+		}
 
 	default:
 		return fmt.Errorf("unsupported certmode: %s", cert.CertMode)
 	}
 	return nil
+}
+
+func safeCertPath(path string) error {
+	if path == "" || strings.Contains(path, "\x00") || strings.Contains(path, "..") || !filepath.IsAbs(path) {
+		return fmt.Errorf("invalid cert path: %s", path)
+	}
+	return nil
+}
+
+func writeIfChanged(path string, content []byte, mode os.FileMode) error {
+	if file.IsExist(path) {
+		current, err := os.ReadFile(path)
+		if err == nil && string(current) == string(content) {
+			return nil
+		}
+	}
+	return os.WriteFile(path, content, mode)
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
