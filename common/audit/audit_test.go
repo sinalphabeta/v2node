@@ -153,4 +153,20 @@ func TestAuditor(t *testing.T) {
 	if a.Check(1, "1.1.1.1", "tcp", domain("bad.com", 443)) {
 		t.Fatal("清空规则后不应阻断")
 	}
+
+	// 隔离动作：优先级高于阻断/记录，阻断本次触发连接但不加入节点 10 分钟封禁列表
+	a.SetRules([]panel.AuditRule{
+		{ID: 10, Action: "block", Match: []string{"iso.example.com"}},
+		{ID: 11, Action: "isolate", Match: []string{"iso.example.com"}},
+	})
+	if !a.Check(4, "4.4.4.4", "tcp", domain("iso.example.com", 443)) {
+		t.Fatal("隔离规则应阻断触发连接")
+	}
+	if a.Check(4, "4.4.4.4", "tcp", domain("good.com", 443)) {
+		t.Fatal("隔离规则不应加入节点 10 分钟封禁")
+	}
+	recs = a.Flush()
+	if len(recs) != 1 || recs[0].RuleID != 11 || recs[0].Action != "isolate" {
+		t.Fatalf("隔离记录不符: %+v", recs)
+	}
 }

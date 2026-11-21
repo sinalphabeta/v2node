@@ -9,11 +9,12 @@ import (
 	panel "github.com/wyx2685/v2node/api/v2board"
 )
 
-// 规则动作，命中多条规则时按 封禁 > 阻断 > 记录 处理。
+// 规则动作，命中多条规则时按 封禁 > 隔离 > 阻断 > 记录 处理。
 const (
-	ActionLog   = "log"
-	ActionBlock = "block"
-	ActionBan   = "ban"
+	ActionLog     = "log"
+	ActionBlock   = "block"
+	ActionIsolate = "isolate"
+	ActionBan     = "ban"
 )
 
 const (
@@ -26,6 +27,8 @@ const (
 func severity(action string) int {
 	switch action {
 	case ActionBan:
+		return 4
+	case ActionIsolate:
 		return 3
 	case ActionBlock:
 		return 2
