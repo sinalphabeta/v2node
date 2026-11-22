@@ -9,8 +9,25 @@ A v2board backend base on moddified xray-core.
 ### 一键安装
 
 ```
-wget -N https://raw.githubusercontent.com/sinalphabeta/v2node/master/script/install.sh && bash install.sh
+wget -N https://raw.githubusercontent.com/sinalphabeta/v2node/main/script/install.sh && bash install.sh
 ```
+
+### 节点机模式（配合 V2go / Gvboard 面板一次性接入）
+
+在面板系统配置「节点」中开启「节点机一次性接入」后，可在「节点机」页面添加服务器并生成一次性安装命令：
+
+```
+wget -N https://raw.githubusercontent.com/sinalphabeta/v2node/main/script/install.sh && bash install.sh --panel https://面板地址 --code 接入码
+```
+
+已安装 v2node 的服务器也可以直接执行：
+
+```
+v2node enroll --panel https://面板地址 --code 接入码 && systemctl restart v2node
+```
+
+- 接入后本机专属凭据保存在 `/etc/v2node/machine.json`（仅 root 可读），`v2node server` 会自动以节点机模式运行，由面板下发节点、审计开关与日志级别，并支持面板远程更新。
+- 删除 `/etc/v2node/machine.json` 并重启即可切回传统 `config.json` 模式。
 
 ### Docker-Compose 安装
 
