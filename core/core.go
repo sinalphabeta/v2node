@@ -71,7 +71,11 @@ func (v *V2Core) Close() error {
 	v.ihm = nil
 	v.ohm = nil
 	v.dispatcher = nil
+	if v.Server == nil {
+		return nil
+	}
 	err := v.Server.Close()
+	v.Server = nil
 	if err != nil {
 		return err
 	}

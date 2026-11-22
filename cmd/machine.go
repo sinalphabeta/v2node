@@ -6,10 +6,13 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
 	"github.com/wyx2685/v2node/limiter"
@@ -39,74 +42,244 @@ func setLogLevel(level string) {
 	}
 }
 
-// machineRunner 节点机模式：按面板下发的配置启动节点，配置变化时重建，凭据被吊销时停止全部节点。
-type machineRunner struct {
-	client   *machine.Client
-	reloadCh chan struct{}
-	nodes    *node.Node
-	core     *core.V2Core
-	cfg      *machine.Config
-	fails    int
-	// started 当前配置已成功启动（未分配节点也算），节点没变化时不重建。
-	started bool
-	// triedUpdate 已尝试过的更新指令，同一指令只尝试一次。
-	triedUpdate int64
+// nodeRuntime 单个节点的独立运行时封装（V2Core + Controller），便于单节点热重载与测试替身注入。
+type nodeRuntime interface {
+	Start(nc conf.NodeConfig, logCfg conf.LogConfig, reloadCh chan struct{}) error
+	Close() error
 }
 
-func (r *machineRunner) running() bool { return r.core != nil }
-
-func (r *machineRunner) stop() {
-	if r.nodes != nil {
-		if err := r.nodes.Close(); err != nil {
-			log.WithField("err", err).Error("关闭节点失败")
-		}
-		r.nodes = nil
-	}
-	if r.core != nil {
-		if err := r.core.Close(); err != nil {
-			log.WithField("err", err).Error("关闭核心失败")
-		}
-		r.core = nil
-	}
-	runtime.GC()
+type xrayNodeRuntime struct {
+	v2core *core.V2Core
+	ctrl   *node.Controller
 }
 
-func (r *machineRunner) start(c *conf.Conf) error {
-	setLogLevel(c.LogConfig.Level)
-	if len(c.NodeConfigs) == 0 {
-		log.Warn("面板没有为这台节点机分配节点，等待分配")
-		return nil
+func newXrayRuntime(_ int) nodeRuntime { return &xrayNodeRuntime{} }
+
+func (r *xrayNodeRuntime) Start(nc conf.NodeConfig, logCfg conf.LogConfig, reloadCh chan struct{}) error {
+	c := conf.New()
+	c.LogConfig = logCfg
+	c.NodeConfigs = []conf.NodeConfig{nc}
+
+	p, err := panel.New(&nc)
+	if err != nil {
+		return err
 	}
-	nodes, err := node.New(c.NodeConfigs)
+	info, err := p.GetNodeInfo(context.Background())
 	if err != nil {
 		return err
 	}
 	v2core := core.New(c)
-	v2core.ReloadCh = r.reloadCh
-	if err := v2core.Start(nodes.NodeInfos); err != nil {
+	v2core.ReloadCh = reloadCh
+	if err := v2core.Start([]*panel.NodeInfo{info}); err != nil {
+		_ = v2core.Close()
 		return err
 	}
-	r.core = v2core
-	if err := nodes.Start(c.NodeConfigs, v2core); err != nil {
+	ctrl := node.NewController(p, &nc, info)
+	if err := ctrl.Start(v2core); err != nil {
+		_ = ctrl.Close()
+		_ = v2core.Close()
 		return err
 	}
-	r.nodes = nodes
+	r.v2core = v2core
+	r.ctrl = ctrl
 	return nil
 }
 
-// apply 按配置重建节点，失败时停止并在下次拉取时强制重试。
-func (r *machineRunner) apply(cfg *machine.Config) {
-	r.stop()
-	r.cfg, r.started = cfg, false
-	if err := r.start(cfg.Conf(r.client.Cred)); err != nil {
-		log.WithField("err", err).Error("启动节点失败，稍后重试")
-		r.stop()
-		r.client.Reset()
+func (r *xrayNodeRuntime) Close() error {
+	var firstErr error
+	if r.ctrl != nil {
+		if err := r.ctrl.Close(); err != nil {
+			firstErr = err
+		}
+		r.ctrl = nil
+	}
+	if r.v2core != nil {
+		if err := r.v2core.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.v2core = nil
+	}
+	return firstErr
+}
+
+// nodeHandle 节点机模式下单个节点的隔离生命周期：独占 V2Core、Controller 与 reloadCh。
+type nodeHandle struct {
+	nodeID   int
+	nc       conf.NodeConfig
+	reloadCh chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+
+	mu     sync.Mutex
+	logCfg conf.LogConfig
+	rt     nodeRuntime
+	active atomic.Bool
+}
+
+func startNodeHandle(nc conf.NodeConfig, logCfg conf.LogConfig, factory func(int) nodeRuntime) (*nodeHandle, error) {
+	if factory == nil {
+		factory = newXrayRuntime
+	}
+	reloadCh := make(chan struct{}, 1)
+	rt := factory(nc.NodeID)
+	if err := rt.Start(nc, logCfg, reloadCh); err != nil {
+		_ = rt.Close()
+		return nil, err
+	}
+	h := &nodeHandle{
+		nodeID:   nc.NodeID,
+		nc:       nc,
+		logCfg:   logCfg,
+		reloadCh: reloadCh,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+		rt:       rt,
+	}
+	h.active.Store(true)
+	go h.watchReload(factory)
+	return h, nil
+}
+
+func (h *nodeHandle) alive() bool { return h.active.Load() }
+
+func (h *nodeHandle) setLogCfg(logCfg conf.LogConfig) {
+	h.mu.Lock()
+	h.logCfg = logCfg
+	h.mu.Unlock()
+}
+
+func (h *nodeHandle) getLogCfg() conf.LogConfig {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.logCfg
+}
+
+func (h *nodeHandle) watchReload(factory func(int) nodeRuntime) {
+	defer close(h.doneCh)
+	for {
+		select {
+		case <-h.stopCh:
+			return
+		case <-h.reloadCh:
+			log.Infof("节点 #%d 收到重载信号，正在独立重启...", h.nodeID)
+			if h.rt != nil {
+				if err := h.rt.Close(); err != nil {
+					log.WithField("err", err).Errorf("节点 #%d 关闭旧实例失败", h.nodeID)
+				}
+				h.rt = nil
+			}
+			select {
+			case <-h.stopCh:
+				return
+			default:
+			}
+			next := factory(h.nodeID)
+			if err := next.Start(h.nc, h.getLogCfg(), h.reloadCh); err != nil {
+				log.WithField("err", err).Errorf("节点 #%d 独立重载失败，将在下次拉取重试", h.nodeID)
+				_ = next.Close()
+				h.active.Store(false)
+				return
+			}
+			h.rt = next
+			runtime.GC()
+			log.Infof("节点 #%d 独立重载完成", h.nodeID)
+		}
+	}
+}
+
+func (h *nodeHandle) stop() {
+	close(h.stopCh)
+	<-h.doneCh
+	h.active.Store(false)
+	if h.rt != nil {
+		if err := h.rt.Close(); err != nil {
+			log.WithField("err", err).Errorf("关闭节点 #%d 失败", h.nodeID)
+		}
+		h.rt = nil
+	}
+}
+
+// machineRunner 节点机模式：按面板下发配置为每个节点维护独立生命周期，互不影响；凭据被吊销时停止全部节点。
+type machineRunner struct {
+	client     *machine.Client
+	newRuntime func(nodeID int) nodeRuntime
+	handles    map[int]*nodeHandle
+	cfg        *machine.Config
+	fails      int
+	// triedUpdate 已尝试过的更新指令，同一指令只尝试一次。
+	triedUpdate int64
+}
+
+func (r *machineRunner) running() bool {
+	for _, h := range r.handles {
+		if h.alive() {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *machineRunner) stopAll() {
+	if len(r.handles) == 0 {
 		return
 	}
-	r.started = true
-	if r.running() {
-		log.Infof("已按面板配置启动 %d 个节点", len(cfg.Nodes))
+	for id, h := range r.handles {
+		h.stop()
+		delete(r.handles, id)
+	}
+	runtime.GC()
+}
+
+// reconcile 按最新配置增量增删并重试未就绪节点；对已在运行且配置未变的节点完全不中断。
+func (r *machineRunner) reconcile(cfg *machine.Config) {
+	c := cfg.Conf(r.client.Cred)
+	if r.cfg == nil || r.cfg.LogLevel != cfg.LogLevel {
+		setLogLevel(c.LogConfig.Level)
+	}
+	firstSync := r.cfg == nil
+	r.cfg = cfg
+
+	if r.handles == nil {
+		r.handles = make(map[int]*nodeHandle)
+	}
+
+	wanted := make(map[int]conf.NodeConfig, len(c.NodeConfigs))
+	for _, nc := range c.NodeConfigs {
+		wanted[nc.NodeID] = nc
+	}
+
+	stoppedAny := false
+	for id, h := range r.handles {
+		if _, ok := wanted[id]; !ok || !h.alive() {
+			log.Infof("节点 #%d 已移除或需重建，正在停止...", id)
+			h.stop()
+			delete(r.handles, id)
+			stoppedAny = true
+		}
+	}
+	if stoppedAny {
+		runtime.GC()
+	}
+
+	if len(c.NodeConfigs) == 0 {
+		if firstSync {
+			log.Warn("面板没有为这台节点机分配可用节点，等待分配")
+		}
+		return
+	}
+
+	for _, nc := range c.NodeConfigs {
+		if h, ok := r.handles[nc.NodeID]; ok {
+			h.setLogCfg(c.LogConfig)
+			continue
+		}
+		h, err := startNodeHandle(nc, c.LogConfig, r.newRuntime)
+		if err != nil {
+			log.WithField("err", err).Errorf("节点 #%d 启动失败，不影响其他节点，将在下次拉取重试", nc.NodeID)
+			continue
+		}
+		r.handles[nc.NodeID] = h
+		log.Infof("节点 #%d 已独立启动", nc.NodeID)
 	}
 }
 
@@ -119,8 +292,8 @@ func (r *machineRunner) poll() time.Duration {
 	case errors.Is(err, machine.ErrRevoked):
 		r.fails++
 		if r.fails >= revokeAfter && (r.running() || r.cfg != nil) {
-			log.Error("面板拒绝了本机凭据（已吊销、已删除或面板关闭了节点机），停止全部节点；重新接入请在面板生成新的安装命令")
-			r.stop()
+			log.Error("面板拒绝了本机凭据（已吊销或已删除），停止全部节点；重新接入请在面板生成新的安装命令")
+			r.stopAll()
 			r.cfg = nil
 			r.client.Reset()
 		} else if r.fails < revokeAfter {
@@ -132,14 +305,13 @@ func (r *machineRunner) poll() time.Duration {
 		return r.interval()
 	}
 	r.fails = 0
-	switch {
-	case changed && r.started && r.cfg.SameNodes(cfg):
-		r.cfg = cfg
-	case changed:
-		log.Info("节点机配置已更新，重新加载")
-		r.apply(cfg)
+	if cfg != nil {
+		if changed {
+			log.Info("节点机配置已更新，按节点增量同步")
+		}
+		r.reconcile(cfg)
+		r.update(cfg.Update)
 	}
-	r.update(cfg.Update)
 	return r.interval()
 }
 
@@ -159,12 +331,12 @@ func (r *machineRunner) update(u *machine.Update) {
 		return
 	}
 	log.Infof("已更新到 %s，重启程序", u.Version)
-	r.stop()
+	r.stopAll()
 	err = machine.Restart(exe)
 	log.WithField("err", err).Error("重启失败，新版本将在下次启动时生效")
 	r.client.Report(u.ID, err)
 	if r.cfg != nil {
-		r.apply(r.cfg)
+		r.reconcile(r.cfg)
 	}
 }
 
@@ -187,8 +359,11 @@ func machineHandle(path string) {
 	}
 	log.Infof("节点机模式：面板 %s，节点机 #%d", cred.Panel, cred.MachineID)
 	limiter.Init()
-	r := &machineRunner{client: &machine.Client{Cred: cred, Version: version}, reloadCh: make(chan struct{}, 1)}
-	defer r.stop()
+	r := &machineRunner{
+		client:     &machine.Client{Cred: cred, Version: version},
+		newRuntime: newXrayRuntime,
+	}
+	defer r.stopAll()
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
@@ -197,13 +372,8 @@ func machineHandle(path string) {
 		select {
 		case <-osSignals:
 			log.Info("收到退出信号，正在关闭程序...")
-			r.stop()
+			r.stopAll()
 			os.Exit(0)
-		case <-r.reloadCh:
-			if r.cfg != nil {
-				log.Info("收到重启信号，正在重新加载...")
-				r.apply(r.cfg)
-			}
 		case <-timer.C:
 			timer.Reset(r.poll())
 		}

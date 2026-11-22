@@ -18,6 +18,7 @@ type Controller struct {
 	server                  *core.V2Core
 	apiClient               *panel.Client
 	tag                     string
+	nodeAdded               bool
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
 	aliveMap                map[int]int
@@ -43,6 +44,12 @@ func NewController(api *panel.Client, conf *conf.NodeConfig, info *panel.NodeInf
 func (c *Controller) Start(x *core.V2Core) error {
 	// Init Core
 	c.server = x
+	started := false
+	defer func() {
+		if !started {
+			_ = c.Close()
+		}
+	}()
 	var err error
 	// First fetch Node Info
 	node := c.info
@@ -81,6 +88,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	if err != nil {
 		return fmt.Errorf("add new node error: %s", err)
 	}
+	c.nodeAdded = true
 	added, err := c.server.AddUsers(&core.AddUsersParams{
 		Tag:      c.tag,
 		Users:    c.userList,
@@ -93,25 +101,34 @@ func (c *Controller) Start(x *core.V2Core) error {
 	c.info = node
 	c.startAudit()
 	c.startTasks(node)
+	started = true
 	return nil
 }
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
-	limiter.DeleteLimiter(c.tag)
+	if c.tag != "" {
+		limiter.DeleteLimiter(c.tag)
+	}
 	if c.nodeInfoMonitorPeriodic != nil {
 		c.nodeInfoMonitorPeriodic.Close()
+		c.nodeInfoMonitorPeriodic = nil
 	}
 	if c.userReportPeriodic != nil {
 		c.userReportPeriodic.Close()
+		c.userReportPeriodic = nil
 	}
 	if c.renewCertPeriodic != nil {
 		c.renewCertPeriodic.Close()
+		c.renewCertPeriodic = nil
 	}
 	c.closeAudit()
-	err := c.server.DelNode(c.tag)
-	if err != nil {
-		return fmt.Errorf("del node error: %s", err)
+	if c.server != nil && c.nodeAdded && c.tag != "" {
+		err := c.server.DelNode(c.tag)
+		c.nodeAdded = false
+		if err != nil {
+			return fmt.Errorf("del node error: %s", err)
+		}
 	}
 	return nil
 }

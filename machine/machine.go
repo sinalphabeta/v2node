@@ -23,7 +23,7 @@ import (
 // DefaultPath 凭据文件默认位置，存在时 v2node server 进入节点机模式。
 const DefaultPath = "/etc/v2node/machine.json"
 
-// ErrRevoked 面板返回 404：凭据已吊销、节点机已删除或面板关闭了节点机。
+// ErrRevoked 面板返回 404：凭据已吊销或节点机已删除。
 var ErrRevoked = errors.New("节点机凭据无效或已被吊销")
 
 // Credential 本机凭据。
@@ -98,7 +98,7 @@ func Enroll(ctx context.Context, panel, code, hostname, version string) (*Creden
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return nil, errors.New("接入码无效、已过期或已使用，或面板未开启节点机（请在面板重新生成安装命令）")
+		return nil, errors.New("接入码无效、已过期或已使用（请在面板重新生成安装命令）")
 	default:
 		return nil, fmt.Errorf("面板返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
