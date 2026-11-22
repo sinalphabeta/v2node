@@ -357,10 +357,11 @@ func machineHandle(path string) {
 		log.WithField("err", err).Error("读取节点机凭据失败")
 		return
 	}
-	log.Infof("节点机模式：面板 %s，节点机 #%d", cred.Panel, cred.MachineID)
+	log.Infof("节点机模式：面板 %s，节点机 #%d，实例 %s", cred.Panel, cred.MachineID, cred.InstanceID)
 	limiter.Init()
+	host, _ := os.Hostname()
 	r := &machineRunner{
-		client:     &machine.Client{Cred: cred, Version: version},
+		client:     &machine.Client{Cred: cred, Hostname: host, Version: version},
 		newRuntime: newXrayRuntime,
 	}
 	defer r.stopAll()

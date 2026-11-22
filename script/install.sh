@@ -41,7 +41,7 @@ API_HOST_ARG=""
 NODE_ID_ARG=""
 API_KEY_ARG=""
 PANEL_ARG=""
-CODE_ARG=""
+TOKEN_ARG=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -54,11 +54,11 @@ parse_args() {
                 API_KEY_ARG="$2"; shift 2 ;;
             --panel)
                 PANEL_ARG="$2"; shift 2 ;;
-            --code)
-                CODE_ARG="$2"; shift 2 ;;
+            --token)
+                TOKEN_ARG="$2"; shift 2 ;;
             -h|--help)
                 echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY]"
-                echo "      $0 [版本号] --panel 面板地址 --code 接入码    （节点机模式，命令由面板生成）"
+                echo "      $0 [版本号] --panel 面板地址 --token 固定Token  （节点机模式，命令由面板生成）"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -71,8 +71,8 @@ parse_args() {
                 fi ;;
         esac
     done
-    if [[ -n "$PANEL_ARG" || -n "$CODE_ARG" ]] && [[ -z "$PANEL_ARG" || -z "$CODE_ARG" ]]; then
-        echo "--panel 与 --code 必须同时提供"; exit 1
+    if [[ -n "$PANEL_ARG" || -n "$TOKEN_ARG" ]] && [[ -z "$PANEL_ARG" || -z "$TOKEN_ARG" ]]; then
+        echo "--panel 与 --token 必须同时提供"; exit 1
     fi
 }
 
@@ -370,9 +370,9 @@ EOF
     fi
 
     if [[ -n "$PANEL_ARG" ]]; then
-        # 节点机模式：用接入码换取本机凭据（/etc/v2node/machine.json），节点配置由面板下发
-        if ! /usr/local/v2node/v2node enroll --panel "$PANEL_ARG" --code "$CODE_ARG"; then
-            echo -e "${red}接入面板失败，请在面板重新生成安装命令后再试${plain}"
+        # 节点机模式：使用固定 Token 校验并生成本机 instance_id 凭据（/etc/v2node/machine.json），节点配置由面板下发
+        if ! /usr/local/v2node/v2node enroll --panel "$PANEL_ARG" --token "$TOKEN_ARG"; then
+            echo -e "${red}接入面板失败，请在面板核对节点机安装命令或 Token 状态后再试${plain}"
             exit 1
         fi
         if [[ ! -f /etc/v2node/config.json ]]; then

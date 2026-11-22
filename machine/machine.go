@@ -1,9 +1,9 @@
-// Package machine 节点机模式（配合 V2go / Gvboard 面板）：用一次性接入码换取本机凭据，节点配置由面板下发。
+// Package machine 节点机模式（配合 V2go / Gvboard 面板）：使用节点机固定 Token 接入，节点配置由面板统一下发。
 package machine
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,17 +23,26 @@ import (
 // DefaultPath 凭据文件默认位置，存在时 v2node server 进入节点机模式。
 const DefaultPath = "/etc/v2node/machine.json"
 
-// ErrRevoked 面板返回 404：凭据已吊销或节点机已删除。
+// ErrRevoked 面板返回 404：Token 无效、已被重置/吊销或节点机已删除。
 var ErrRevoked = errors.New("节点机凭据无效或已被吊销")
 
-// Credential 本机凭据。
+// Credential 本机凭据。InstanceID 用于区分共用同一固定 Token 的多台负载均衡服务器。
 type Credential struct {
-	Panel     string `json:"panel"`
-	MachineID int64  `json:"machine_id"`
-	Token     string `json:"token"`
+	Panel      string `json:"panel"`
+	MachineID  int64  `json:"machine_id"`
+	InstanceID string `json:"instance_id"`
+	Token      string `json:"token"`
 }
 
-// Load 读取凭据文件。
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// Load 读取凭据文件；若历史凭据缺少 instance_id 则自动补全并写回文件。
 func Load(path string) (*Credential, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -45,6 +54,10 @@ func Load(path string) (*Credential, error) {
 	}
 	if c.Panel == "" || c.Token == "" {
 		return nil, fmt.Errorf("%s 缺少 panel 或 token", path)
+	}
+	if strings.TrimSpace(c.InstanceID) == "" {
+		c.InstanceID = newUUID()
+		_ = Save(path, &c)
 	}
 	return &c, nil
 }
@@ -77,18 +90,30 @@ func NormalizePanel(panel string) (string, error) {
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
-// Enroll 用接入码向面板换取凭据。
-func Enroll(ctx context.Context, panel, code, hostname, version string) (*Credential, error) {
+// Verify 使用固定 Token 向面板校验连通性并生成/保留本机 instance_id 凭据。
+func Verify(ctx context.Context, panel, token, instanceID, hostname, version string) (*Credential, error) {
 	panel, err := NormalizePanel(panel)
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.Marshal(map[string]string{"code": strings.TrimSpace(code), "hostname": hostname, "version": version})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, panel+"/api/v2/server/machine/enroll", bytes.NewReader(body))
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errors.New("节点机 Token 不能为空")
+	}
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		instanceID = newUUID()
+	}
+	q := url.Values{
+		"instance_id": {instanceID},
+		"hostname":    {hostname},
+		"version":     {version},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, panel+"/api/v2/server/machine/config?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("连接面板失败: %w", err)
@@ -98,18 +123,15 @@ func Enroll(ctx context.Context, panel, code, hostname, version string) (*Creden
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return nil, errors.New("接入码无效、已过期或已使用（请在面板重新生成安装命令）")
+		return nil, errors.New("节点机 Token 无效或已被重置/吊销（请在面板查看安装命令）")
 	default:
 		return nil, fmt.Errorf("面板返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	var out struct {
-		MachineID int64  `json:"machine_id"`
-		Token     string `json:"token"`
-	}
-	if err := json.Unmarshal(b, &out); err != nil || out.Token == "" {
+	var out Config
+	if err := json.Unmarshal(b, &out); err != nil || out.MachineID <= 0 {
 		return nil, fmt.Errorf("面板返回内容无法识别: %s", strings.TrimSpace(string(b)))
 	}
-	return &Credential{Panel: panel, MachineID: out.MachineID, Token: out.Token}, nil
+	return &Credential{Panel: panel, MachineID: out.MachineID, InstanceID: instanceID, Token: token}, nil
 }
 
 // NodeConfig 面板下发的单个节点。
@@ -119,6 +141,7 @@ type NodeConfig struct {
 
 // Config 面板下发的配置。
 type Config struct {
+	MachineID    int64        `json:"machine_id"`
 	LogLevel     string       `json:"log_level"`
 	PullInterval int          `json:"pull_interval"`
 	Nodes        []NodeConfig `json:"nodes"`
@@ -149,10 +172,11 @@ func (c *Config) Conf(cred *Credential) *conf.Conf {
 
 // Client 拉取本机配置，支持 ETag。
 type Client struct {
-	Cred    *Credential
-	Version string
-	etag    string
-	last    *Config
+	Cred     *Credential
+	Hostname string
+	Version  string
+	etag     string
+	last     *Config
 	// 待上报的更新失败原因，面板收到后清除。
 	reportID  int64
 	reportErr string
@@ -172,7 +196,16 @@ func (c *Client) Report(id int64, err error) {
 
 // Fetch 拉取配置。changed 为 false 表示与上次相同；面板返回 404 时返回 ErrRevoked。
 func (c *Client) Fetch(ctx context.Context) (cfg *Config, changed bool, err error) {
+	if c.Hostname == "" {
+		c.Hostname, _ = os.Hostname()
+	}
 	q := url.Values{"version": {c.Version}}
+	if c.Cred != nil && c.Cred.InstanceID != "" {
+		q.Set("instance_id", c.Cred.InstanceID)
+	}
+	if c.Hostname != "" {
+		q.Set("hostname", c.Hostname)
+	}
 	if c.reportID != 0 {
 		q.Set("update_id", strconv.FormatInt(c.reportID, 10))
 		q.Set("update_error", c.reportErr)
