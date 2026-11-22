@@ -34,7 +34,7 @@ func TestEnrollFetch(t *testing.T) {
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
-			_, _ = w.Write([]byte(`{"log_level":"debug","pull_interval":30,"nodes":[{"node_id":1},{"node_id":2,"audit_enable":true}]}`))
+			_, _ = w.Write([]byte(`{"log_level":"debug","pull_interval":30,"nodes":[{"node_id":1},{"node_id":2}]}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -71,8 +71,8 @@ func TestEnrollFetch(t *testing.T) {
 		t.Fatalf("首次拉取不符: %+v %v %v", cfg, changed, err)
 	}
 	cc := cfg.Conf(loaded)
-	if cc.LogConfig.Level != "debug" || len(cc.NodeConfigs) != 2 || cc.NodeConfigs[1].NodeID != 2 || !cc.NodeConfigs[1].AuditEnable ||
-		cc.NodeConfigs[0].AuditEnable || cc.NodeConfigs[0].APIHost != srv.URL || cc.NodeConfigs[0].Key != "gvm_abc" {
+	if cc.LogConfig.Level != "debug" || len(cc.NodeConfigs) != 2 || cc.NodeConfigs[1].NodeID != 2 ||
+		cc.NodeConfigs[0].APIHost != srv.URL || cc.NodeConfigs[0].Key != "gvm_abc" {
 		t.Fatalf("转换配置不符: %+v", cc)
 	}
 	if again, changed, err := c.Fetch(ctx); err != nil || changed || again != cfg {

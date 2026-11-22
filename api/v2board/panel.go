@@ -22,9 +22,21 @@ type Client struct {
 	nodeEtag         string
 	userEtag         string
 	auditEtag        string
+	auditEnable      bool
 	responseBodyHash string
+	coreBodyHash     string
 	UserList         *UserListBody
 	AliveMap         *AliveMap
+}
+
+// AuditEnabled 返回最近一次从面板拉取到的审计开关状态。
+func (c *Client) AuditEnabled() bool {
+	return c.auditEnable
+}
+
+// ResetAuditETag 清空审计规则缓存 ETag，确保重新开启审计时能完整拉回规则。
+func (c *Client) ResetAuditETag() {
+	c.auditEtag = ""
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {

@@ -32,11 +32,12 @@ type NodeInfo struct {
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	Protocol    string      `json:"protocol"`
+	ListenIP    string      `json:"listen_ip"`
+	ServerPort  int         `json:"server_port"`
+	Routes      []Route     `json:"routes"`
+	BaseConfig  *BaseConfig `json:"base_config"`
+	AuditEnable bool        `json:"audit_enable"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -136,31 +137,30 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
+	if r.RawBody() != nil {
+		defer r.RawBody().Close()
+	}
 	hash := sha256.Sum256(r.Body())
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
 		return nil, nil
 	}
-	c.responseBodyHash = newBodyHash
-	c.nodeEtag = r.Header().Get("ETag")
-
-	if r != nil {
-		defer func() {
-			if r.RawBody() != nil {
-				r.RawBody().Close()
-			}
-		}()
-	} else {
-		return nil, fmt.Errorf("received nil response")
-	}
-	node = &NodeInfo{
-		Id: c.NodeId,
-	}
-	// parse protocol params
+	// parse protocol params first so audit_enable updates can be detected without tearing down Core
 	cm := &CommonNode{}
 	err = json.Unmarshal(r.Body(), cm)
 	if err != nil {
 		return nil, fmt.Errorf("decode node params error: %s", err)
+	}
+	c.responseBodyHash = newBodyHash
+	c.nodeEtag = r.Header().Get("ETag")
+	c.auditEnable = cm.AuditEnable
+	newCoreHash := hashCoreConfig(r.Body())
+	if c.coreBodyHash != "" && c.coreBodyHash == newCoreHash {
+		return nil, nil
+	}
+	c.coreBodyHash = newCoreHash
+	node = &NodeInfo{
+		Id: c.NodeId,
 	}
 	switch cm.Protocol {
 	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
@@ -253,4 +253,18 @@ func (t TlsSettings) PrimaryServerName() string {
 		return ""
 	}
 	return serverNames[0]
+}
+
+// hashCoreConfig 计算剔除顶层 audit_enable 后的配置哈希；仅审计开关变化时不触发节点 Core 重启。
+func hashCoreConfig(raw []byte) string {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err == nil && top != nil {
+		delete(top, "audit_enable")
+		if b, err := json.Marshal(top); err == nil {
+			sum := sha256.Sum256(b)
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

@@ -114,8 +114,7 @@ func Enroll(ctx context.Context, panel, code, hostname, version string) (*Creden
 
 // NodeConfig 面板下发的单个节点。
 type NodeConfig struct {
-	NodeID      int  `json:"node_id"`
-	AuditEnable bool `json:"audit_enable"`
+	NodeID int `json:"node_id"`
 }
 
 // Config 面板下发的配置。
@@ -142,7 +141,7 @@ func (c *Config) Conf(cred *Credential) *conf.Conf {
 	for _, n := range c.Nodes {
 		out.NodeConfigs = append(out.NodeConfigs, conf.NodeConfig{
 			APIHost: cred.Panel, NodeID: n.NodeID, Key: cred.Token, Timeout: conf.DefaultNodeTimeout,
-			RetryCount: &retry, AuditEnable: n.AuditEnable,
+			RetryCount: &retry,
 		})
 	}
 	return out
