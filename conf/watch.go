@@ -8,7 +8,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-func (p *Conf) Watch(filePath string, reload func()) error {
+// WatchFile watches filePath with a short debounce and invokes onChange without mutating any Conf struct.
+func WatchFile(filePath string, onChange func()) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("new watcher error: %s", err)
@@ -29,13 +30,7 @@ func (p *Conf) Watch(filePath string, reload func()) error {
 				go func() {
 					time.Sleep(5 * time.Second)
 					log.Println("config file changed, reloading...")
-					*p = *New()
-					err := p.LoadFromPath(filePath)
-					if err != nil {
-						log.Printf("reload config error: %s", err)
-					}
-					reload()
-					log.Println("reload config success")
+					onChange()
 				}()
 			case err := <-watcher.Errors:
 				if err != nil {
@@ -46,7 +41,21 @@ func (p *Conf) Watch(filePath string, reload func()) error {
 	}()
 	err = watcher.Add(filePath)
 	if err != nil {
+		_ = watcher.Close()
 		return fmt.Errorf("watch file error: %s", err)
 	}
 	return nil
+}
+
+func (p *Conf) Watch(filePath string, reload func()) error {
+	return WatchFile(filePath, func() {
+		next := New()
+		if err := next.LoadFromPath(filePath); err != nil {
+			log.Printf("reload config error: %s", err)
+			return
+		}
+		*p = *next
+		reload()
+		log.Println("reload config success")
+	})
 }

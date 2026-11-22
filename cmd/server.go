@@ -8,14 +8,13 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core"
 	"github.com/wyx2685/v2node/limiter"
 	"github.com/wyx2685/v2node/machine"
-	"github.com/wyx2685/v2node/node"
 )
 
 var (
@@ -61,23 +60,6 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("Load config file failed")
 		return
 	}
-	switch c.LogConfig.Level {
-	case "debug":
-		log.SetLevel(log.DebugLevel)
-	case "info":
-		log.SetLevel(log.InfoLevel)
-	case "warn", "warning":
-		log.SetLevel(log.WarnLevel)
-	case "error":
-		log.SetLevel(log.ErrorLevel)
-	}
-	if c.LogConfig.Output != "" {
-		f, err := os.OpenFile(c.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.WithField("err", err).Error("Open log file failed, using stdout instead")
-		}
-		log.SetOutput(f)
-	}
 	// Enable pprof if configured
 	if c.PprofPort != 0 {
 		go func() {
@@ -87,38 +69,19 @@ func serverHandle(_ *cobra.Command, _ []string) {
 			}
 		}()
 	}
-	//init limiter
 	limiter.Init()
-	//get node info
-	nodes, err := node.New(c.NodeConfigs)
-	if err != nil {
-		log.WithField("err", err).Error("Get node info failed")
-		return
-	}
-	log.Info("Got nodes info from server")
-	//core
-	var reloadCh = make(chan struct{}, 1)
-	v2core := core.New(c)
-	v2core.ReloadCh = reloadCh
-	err = v2core.Start(nodes.NodeInfos)
-	if err != nil {
-		log.WithField("err", err).Error("Start core failed")
-		return
-	}
-	defer v2core.Close()
-	//node
-	err = nodes.Start(c.NodeConfigs, v2core)
-	if err != nil {
-		log.WithField("err", err).Error("Run nodes failed")
-		return
-	}
+
+	runner := &configRunner{newRuntime: newXrayRuntime}
+	runner.applyConf(c)
+	defer runner.stopAll()
 	log.Info("Nodes started")
+
+	var reloadCh = make(chan struct{}, 1)
 	if watch {
-		// On file change, just signal reload; do not run reload concurrently here
-		err = c.Watch(config, func() {
+		err = conf.WatchFile(config, func() {
 			select {
 			case reloadCh <- struct{}{}:
-			default: // drop if a reload is already queued
+			default:
 			}
 		})
 		if err != nil {
@@ -126,8 +89,10 @@ func serverHandle(_ *cobra.Command, _ []string) {
 			return
 		}
 	}
-	// clear memory
 	runtime.GC()
+
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
@@ -136,79 +101,166 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		select {
 		case <-osSignals:
 			log.Info("收到退出信号，正在关闭程序...")
+			runner.stopAll()
 			os.Exit(0)
 		case <-reloadCh:
-			log.Info("收到重启信号，正在重新加载配置...")
-			if err := reload(config, &nodes, &v2core); err != nil {
-				log.WithField("err", err).Panic("重启失败")
-			}
-			log.Info("重启成功")
+			log.Info("收到配置文件变更信号，正在增量重载...")
+			runner.reloadFromPath(config)
+		case <-ticker.C:
+			runner.reconcile()
 		}
 	}
 }
 
-func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
-	// Preserve old reload channel so new core continues to receive signals
-	var oldReloadCh chan struct{}
-	if *v2core != nil {
-		oldReloadCh = (*v2core).ReloadCh
-	}
+type configKey struct {
+	host   string
+	nodeID int
+}
 
-	if err := (*nodes).Close(); err != nil {
-		return err
-	}
+// configRunner 传统 config.json 模式：同样按节点隔离 V2Core 与 Controller，避免单节点异常或证书更新拖垮整机。
+type configRunner struct {
+	newRuntime func(nodeID int) nodeRuntime
+	handles    map[configKey]*nodeHandle
+	desired    []conf.NodeConfig
+	logCfg     conf.LogConfig
+	hasLog     bool
+}
 
-	if err := (*v2core).Close(); err != nil {
-		return err
-	}
+func keyOf(nc conf.NodeConfig) configKey {
+	return configKey{host: nc.APIHost, nodeID: nc.NodeID}
+}
 
-	newConf := conf.New()
-	if err := newConf.LoadFromPath(config); err != nil {
-		return err
+func effectiveRetryCount(nc conf.NodeConfig) int {
+	if nc.RetryCount == nil {
+		return conf.DefaultNodeRetryCount
 	}
+	return *nc.RetryCount
+}
 
-	switch newConf.LogConfig.Level {
-	case "debug":
-		log.SetLevel(log.DebugLevel)
-	case "info":
-		log.SetLevel(log.InfoLevel)
-	case "warn", "warning":
-		log.SetLevel(log.WarnLevel)
-	case "error":
-		log.SetLevel(log.ErrorLevel)
+func nodeConfigEqual(a, b conf.NodeConfig) bool {
+	return a.APIHost == b.APIHost &&
+		a.NodeID == b.NodeID &&
+		a.Key == b.Key &&
+		a.Timeout == b.Timeout &&
+		effectiveRetryCount(a) == effectiveRetryCount(b)
+}
+
+func applyLogConfig(cur *conf.LogConfig, next conf.LogConfig, initialized bool) {
+	setLogLevel(next.Level)
+	if initialized && cur.Output == next.Output {
+		*cur = next
+		return
 	}
-	if newConf.LogConfig.Output != "" {
-		f, err := os.OpenFile(newConf.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	oldWriter, wasFile := log.StandardLogger().Out.(*os.File)
+	if next.Output != "" {
+		f, err := os.OpenFile(next.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.WithField("err", err).Error("Open log file failed, using stdout instead")
 		} else {
-			// 关闭旧的日志文件（如果是文件）
-			if oldWriter, ok := log.StandardLogger().Out.(*os.File); ok && oldWriter != os.Stdout && oldWriter != os.Stderr {
-				oldWriter.Close()
-			}
 			log.SetOutput(f)
+			if wasFile && oldWriter != os.Stdout && oldWriter != os.Stderr {
+				_ = oldWriter.Close()
+			}
+		}
+	} else if initialized && cur.Output != "" {
+		log.SetOutput(os.Stdout)
+		if wasFile && oldWriter != os.Stdout && oldWriter != os.Stderr {
+			_ = oldWriter.Close()
 		}
 	}
+	*cur = next
+}
 
-	newNodes, err := node.New(newConf.NodeConfigs)
-	if err != nil {
-		return err
+func (r *configRunner) stopAll() {
+	if len(r.handles) == 0 {
+		return
 	}
-
-	newCore := core.New(newConf)
-	// Reattach reload channel
-	newCore.ReloadCh = oldReloadCh
-	if err := newCore.Start(newNodes.NodeInfos); err != nil {
-		return err
+	for k, h := range r.handles {
+		h.stop()
+		delete(r.handles, k)
 	}
-
-	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
-		return err
-	}
-
-	*nodes = newNodes
-	*v2core = newCore
-
 	runtime.GC()
-	return nil
+}
+
+func (r *configRunner) applyConf(c *conf.Conf) {
+	if r.handles == nil {
+		r.handles = make(map[configKey]*nodeHandle)
+	}
+	applyLogConfig(&r.logCfg, c.LogConfig, r.hasLog)
+	r.hasLog = true
+
+	wanted := make(map[configKey]conf.NodeConfig, len(c.NodeConfigs))
+	desired := make([]conf.NodeConfig, 0, len(c.NodeConfigs))
+	for _, nc := range c.NodeConfigs {
+		k := keyOf(nc)
+		if _, dup := wanted[k]; dup {
+			continue
+		}
+		wanted[k] = nc
+		desired = append(desired, nc)
+	}
+	r.desired = desired
+
+	stoppedAny := false
+	for k, h := range r.handles {
+		nc, ok := wanted[k]
+		if !ok || !h.alive() || !nodeConfigEqual(h.nc, nc) {
+			log.Infof("节点 #%d (%s) 已移除、配置变更或失活，正在停止...", k.nodeID, k.host)
+			h.stop()
+			delete(r.handles, k)
+			stoppedAny = true
+		} else {
+			h.setLogCfg(r.logCfg)
+		}
+	}
+	if stoppedAny {
+		runtime.GC()
+	}
+
+	r.startMissing()
+}
+
+func (r *configRunner) reconcile() {
+	if r.handles == nil {
+		return
+	}
+	stoppedAny := false
+	for k, h := range r.handles {
+		if !h.alive() {
+			log.Infof("节点 #%d (%s) 已失活，准备重建...", k.nodeID, k.host)
+			h.stop()
+			delete(r.handles, k)
+			stoppedAny = true
+		}
+	}
+	if stoppedAny {
+		runtime.GC()
+	}
+	r.startMissing()
+}
+
+func (r *configRunner) startMissing() {
+	for _, nc := range r.desired {
+		k := keyOf(nc)
+		if h, ok := r.handles[k]; ok && h.alive() {
+			continue
+		}
+		h, err := startNodeHandle(nc, r.logCfg, r.newRuntime)
+		if err != nil {
+			log.WithField("err", err).Errorf("节点 #%d (%s) 启动失败，不影响其他节点，将在 %s 后重试", nc.NodeID, nc.APIHost, retryInterval)
+			continue
+		}
+		r.handles[k] = h
+		log.Infof("节点 #%d (%s) 已独立启动", nc.NodeID, nc.APIHost)
+	}
+}
+
+func (r *configRunner) reloadFromPath(path string) {
+	next := conf.New()
+	if err := next.LoadFromPath(path); err != nil {
+		log.WithField("err", err).Error("重新加载配置文件失败，保持当前节点运行状态")
+		return
+	}
+	r.applyConf(next)
+	log.Info("配置文件增量重载完成")
 }

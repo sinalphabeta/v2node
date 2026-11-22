@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -54,7 +55,11 @@ func New(config *conf.Conf) *V2Core {
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	v.access.Lock()
 	defer v.access.Unlock()
-	v.Server = getCore(v.Config, infos)
+	srv, err := getCore(v.Config, infos)
+	if err != nil {
+		return err
+	}
+	v.Server = srv
 	if err := v.Server.Start(); err != nil {
 		return err
 	}
@@ -82,7 +87,7 @@ func (v *V2Core) Close() error {
 	return nil
 }
 
-func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
+func getCore(c *conf.Conf, infos []*panel.NodeInfo) (*core.Instance, error) {
 	// Log Config
 	coreLogConfig := &coreConf.LogConfig{
 		LogLevel:  c.LogConfig.Level,
@@ -92,7 +97,7 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
 	// Custom config
 	dnsConfig, outBoundConfig, routeConfig, err := GetCustomConfig(infos)
 	if err != nil {
-		log.WithField("err", err).Panic("failed to build custom config")
+		return nil, fmt.Errorf("failed to build custom config: %w", err)
 	}
 	// Inbound config
 	var inBoundConfig []*core.InboundHandlerConfig
@@ -127,8 +132,8 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
 	}
 	server, err := core.New(config)
 	if err != nil {
-		log.WithField("err", err).Panic("failed to create instance")
+		return nil, fmt.Errorf("failed to create instance: %w", err)
 	}
 	log.Info("Xray Core Version: ", core.Version())
-	return server
+	return server, nil
 }
