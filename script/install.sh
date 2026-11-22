@@ -375,9 +375,6 @@ EOF
             echo -e "${red}接入面板失败，请在面板核对节点机安装命令或 Token 状态后再试${plain}"
             exit 1
         fi
-        if [[ ! -f /etc/v2node/config.json ]]; then
-            cp config.json /etc/v2node/
-        fi
         if [[ x"${release}" == x"alpine" ]]; then
             service v2node restart
         else
@@ -391,14 +388,14 @@ EOF
             echo -e "${red}v2node 可能启动失败，请使用 v2node log 查看日志信息${plain}"
         fi
         first_install=false
-    elif [[ ! -f /etc/v2node/config.json ]]; then
+    elif [[ ! -f /etc/v2node/config.json && ! -f /etc/v2node/machine.json ]]; then
         # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
         if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
             generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
             echo -e "${green}已根据参数生成 /etc/v2node/config.json${plain}"
             first_install=false
         else
-            cp config.json /etc/v2node/
+            [[ -f config.json ]] && cp config.json /etc/v2node/
             first_install=true
         fi
     else
